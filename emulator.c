@@ -1,9 +1,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <time.h>
+#include <unistd.h>
 
 const int MEMORY_SIZE = 65536;
 const int WORD_MAX = 65535;
+int period_ns = 0;
 
 typedef enum
 {
@@ -85,10 +88,60 @@ void ectx_free(EmulatorCtx *ctx)
 	free(ctx->memory);
 }
 
-void emulate(EmulatorCtx *ctx)
+long long get_boot_time()
 {
+	struct timespec ts;
+	clock_gettime(CLOCK_BOOTTIME, &ts);
+	return ts.tv_nsec + ts.tv_sec * 1000000000;
+}
+
+void spin_lock(long long until_ns)
+{
+	struct timespec ts;
 	while(1)
 	{
+		if(get_boot_time() >= until_ns)
+			break;
+	}
+}
+
+void print_registers(EmulatorCtx *ctx)
+{
+	printf("\npc:%04x, r0:%04x, r1:%04x, r2:%04x, r3:%04x, r4:%04x, r5:%04x, r6:%04x, r7:%04x, sp:%04x, intr:%04x, retr:%04x\n", ctx->pc, ctx->reg_file[0], ctx->reg_file[1], ctx->reg_file[2], ctx->reg_file[3], ctx->reg_file[4], ctx->reg_file[5], ctx->reg_file[6], ctx->reg_file[7], ctx->reg_file[8], ctx->reg_file[9], ctx->reg_file[10]);
+}
+
+void breakpoint(EmulatorCtx *ctx)
+{
+	if(ctx->pc > 100)
+	{
+		print_registers(ctx);
+		char c[2];
+		fgets(c, 2, stdin);
+	}
+}
+
+void emulate(EmulatorCtx *ctx)
+{
+	long long old_time = get_boot_time();
+	long long last_stdout_flush = old_time;
+	while(1)
+	{
+		//breakpoint(ctx);
+		long long new_time = get_boot_time();
+		long long delta_ns = new_time - old_time;
+		long long wait_ns = period_ns - delta_ns;
+		if(wait_ns > 0)
+		{
+			spin_lock(new_time + wait_ns);
+		}
+		old_time = get_boot_time();
+
+		if(old_time - last_stdout_flush > 10000000)
+		{
+			fflush(stdout);
+			last_stdout_flush = old_time;
+		}
+
 		uint16_t instruction = ctx->memory[ctx->pc];
 		Instruction ins = (Instruction)((instruction & 0xFF00) >> 8);
 		char hi_value = (char)((instruction & 0xF0) >> 4);
@@ -101,6 +154,8 @@ void emulate(EmulatorCtx *ctx)
 		if(lo_reg > 15)
 			lo_reg = 0;
 
+		uint16_t old_value;
+		uint16_t difference;
 		switch(ins)
 		{
 			case INS_MOV:
@@ -192,8 +247,8 @@ void emulate(EmulatorCtx *ctx)
 				ctx->pc++;
 				continue;
 			case INS_ANDI:
-				ctx->reg_file[hi_reg] = ctx->reg_file[hi_reg] & byte_value;
-				if(ctx->reg_file[hi_reg] == 0)
+				ctx->reg_file[0] = ctx->reg_file[0] & byte_value;
+				if(ctx->reg_file[0] == 0)
 					ctx->flags |= FLAG_ZERO;
 				else
 					ctx->flags &= ~FLAG_ZERO;
@@ -207,11 +262,11 @@ void emulate(EmulatorCtx *ctx)
 				continue;
 			case INS_PUSH:
 				ctx->memory[ctx->reg_file[8]] = ctx->reg_file[hi_reg];
-				ctx->reg_file[8]++;
+				ctx->reg_file[8]--;
 				ctx->pc++;
 				continue;
 			case INS_POP:
-				ctx->reg_file[8]--;
+				ctx->reg_file[8]++;
 				ctx->reg_file[hi_reg] = ctx->memory[ctx->reg_file[8]];
 				ctx->pc++;
 				continue;
@@ -221,19 +276,19 @@ void emulate(EmulatorCtx *ctx)
 				else
 					ctx->flags &= ~FLAG_OVERFLOW;
 				ctx->reg_file[hi_reg] = ctx->reg_file[hi_reg] - ctx->reg_file[lo_reg];
-				if(ctx->reg_file[hi_reg])
+				if(ctx->reg_file[hi_reg] == 0)
 					ctx->flags |= FLAG_ZERO;
 				else
 					ctx->flags &= ~FLAG_ZERO;
 				ctx->pc++;
 				continue;
 			case INS_SUBI:
-				if(ctx->reg_file[hi_reg] - byte_value > ctx->reg_file[hi_reg])
+				if(ctx->reg_file[0] - byte_value > ctx->reg_file[0])
 					ctx->flags |= FLAG_OVERFLOW;
 				else
 					ctx->flags &= ~FLAG_OVERFLOW;
-				ctx->reg_file[hi_reg] = ctx->reg_file[hi_reg] - byte_value;
-				if(ctx->reg_file[hi_reg] == 0)
+				ctx->reg_file[0] = ctx->reg_file[0] - byte_value;
+				if(ctx->reg_file[0] == 0)
 					ctx->flags |= FLAG_ZERO;
 				else
 					ctx->flags &= ~FLAG_ZERO;
@@ -248,8 +303,8 @@ void emulate(EmulatorCtx *ctx)
 				ctx->pc++;
 				continue;
 			case INS_ORI:
-				ctx->reg_file[hi_reg] = ctx->reg_file[hi_reg] | byte_value;
-				if(ctx->reg_file[hi_reg] == 0)
+				ctx->reg_file[0] = ctx->reg_file[0] | byte_value;
+				if(ctx->reg_file[0] == 0)
 					ctx->flags |= FLAG_ZERO;
 				else
 					ctx->flags &= ~FLAG_ZERO;
@@ -268,12 +323,12 @@ void emulate(EmulatorCtx *ctx)
 				ctx->pc++;
 				continue;
 			case INS_MULI:
-				if(ctx->reg_file[hi_reg] * byte_value < ctx->reg_file[hi_reg])
+				if(ctx->reg_file[0] * byte_value < ctx->reg_file[0])
 					ctx->flags |= FLAG_OVERFLOW;
 				else
 					ctx->flags &= ~FLAG_OVERFLOW;
-				ctx->reg_file[hi_reg] = ctx->reg_file[hi_reg] * byte_value;
-				if(ctx->reg_file[hi_reg] == 0)
+				ctx->reg_file[0] = ctx->reg_file[0] * byte_value;
+				if(ctx->reg_file[0] == 0)
 					ctx->flags |= FLAG_ZERO;
 				else
 					ctx->flags &= ~FLAG_ZERO;
@@ -288,8 +343,126 @@ void emulate(EmulatorCtx *ctx)
 				ctx->pc++;
 				continue;
 			case INS_XORI:
-				ctx->reg_file[hi_reg] = ctx->reg_file[hi_reg] ^ byte_value;
+				ctx->reg_file[0] = ctx->reg_file[0] ^ byte_value;
+				if(ctx->reg_file[0] == 0)
+					ctx->flags |= FLAG_ZERO;
+				else
+					ctx->flags &= ~FLAG_ZERO;
+				ctx->pc++;
+				continue;
+			case INS_ADC:
+				old_value = ctx->reg_file[hi_reg];
+				ctx->reg_file[hi_reg] += ctx->reg_file[lo_reg];
+				if(ctx->flags & FLAG_OVERFLOW)
+					ctx->reg_file[hi_reg]++;
+				if(ctx->reg_file[hi_reg] < old_value || (ctx->reg_file[hi_reg] == old_value && ctx->reg_file[lo_reg] > 0))
+					ctx->flags |= FLAG_OVERFLOW;
+				else
+					ctx->flags &= ~FLAG_OVERFLOW;
 				if(ctx->reg_file[hi_reg] == 0)
+					ctx->flags |= FLAG_ZERO;
+				else
+					ctx->flags &= ~FLAG_ZERO;
+				ctx->pc++;
+				continue;
+			case INS_ADCI:
+				old_value = ctx->reg_file[0];
+				ctx->reg_file[0] += byte_value;
+				if(ctx->flags & FLAG_OVERFLOW)
+					ctx->reg_file[0]++;
+				if(ctx->reg_file[0] < old_value || (ctx->reg_file[0] == old_value && byte_value > 0))
+					ctx->flags |= FLAG_OVERFLOW;
+				else
+					ctx->flags &= ~FLAG_OVERFLOW;
+				if(ctx->reg_file[0] == 0)
+					ctx->flags |= FLAG_ZERO;
+				else
+					ctx->flags &= ~FLAG_ZERO;
+				ctx->pc++;
+				continue;
+			case INS_JZ:
+				if(ctx->flags & FLAG_ZERO)
+					ctx->pc = ctx->reg_file[hi_reg];
+				else
+					ctx->pc++;
+				continue;
+			case INS_JZI:
+				if(ctx->flags & FLAG_ZERO)
+					ctx->pc = byte_value;
+				else
+					ctx->pc++;
+				continue;
+			case INS_JNZ:
+				if((ctx->flags & FLAG_ZERO) == 0)
+					ctx->pc = ctx->reg_file[hi_reg];
+				else
+					ctx->pc++;
+				continue;
+			case INS_JNZI:
+				if((ctx->flags & FLAG_ZERO) == 0)
+					ctx->pc = byte_value;
+				else
+					ctx->pc++;
+				continue;
+			case INS_JC:
+				if(ctx->flags & FLAG_OVERFLOW)
+					ctx->pc = ctx->reg_file[hi_reg];
+				else
+					ctx->pc++;
+				continue;
+			case INS_JCI:
+				if(ctx->flags & FLAG_OVERFLOW)
+					ctx->pc = byte_value;
+				else
+					ctx->pc++;
+				continue;
+			case INS_JNC:
+				if((ctx->flags & FLAG_OVERFLOW) == 0)
+					ctx->pc = ctx->reg_file[hi_reg];
+				else
+					ctx->pc++;
+				continue;
+			case INS_JNCI:
+				if((ctx->flags & FLAG_OVERFLOW) == 0)
+					ctx->pc = byte_value;
+				else
+					ctx->pc++;
+				continue;
+			case INS_PW:
+				putchar((int)ctx->reg_file[0]);
+				ctx->pc++;
+				continue;
+			case INS_CALL:
+				ctx->reg_file[10] = ctx->pc + 1;
+				ctx->pc = ctx->reg_file[hi_reg];
+				continue;
+			case INS_CALLI:
+				ctx->reg_file[10] = ctx->pc + 1;
+				ctx->pc = byte_value;
+				continue;
+			case INS_MHI:
+				ctx->reg_file[0] = (uint16_t)byte_value << 8;
+				ctx->pc++;
+				continue;
+			case INS_CMP:
+				difference = ctx->reg_file[hi_reg] - ctx->reg_file[lo_reg];
+				if(difference > ctx->reg_file[hi_reg])
+					ctx->flags |= FLAG_OVERFLOW;
+				else
+					ctx->flags &= ~FLAG_OVERFLOW;
+				if(difference == 0)
+					ctx->flags |= FLAG_ZERO;
+				else
+					ctx->flags &= ~FLAG_ZERO;
+				ctx->pc++;
+				continue;
+			case INS_CMPI:
+				difference = ctx->reg_file[0] - byte_value;
+				if(difference > ctx->reg_file[0])
+					ctx->flags |= FLAG_OVERFLOW;
+				else
+					ctx->flags &= ~FLAG_OVERFLOW;
+				if(difference == 0)
 					ctx->flags |= FLAG_ZERO;
 				else
 					ctx->flags &= ~FLAG_ZERO;
@@ -298,6 +471,7 @@ void emulate(EmulatorCtx *ctx)
 
 			default:
 				ctx->pc++;
+				puts("Unhandled Instruction!");
 				continue;
 		}
 	}
@@ -342,6 +516,17 @@ int main(int argc, const char **argv)
 		ctx.memory[i] = (uint16_t)value;
 	}
 	free(file_buffer);
+
+	if(argc > 2)
+	{
+		int fps = atoi(argv[2]);
+		if(fps == 0)
+			fps = 10000000;
+		period_ns = 1000000000ll / fps;
+		printf("Period: %dns\n", period_ns);
+	}
+
+	emulate(&ctx);
 
 	ectx_free(&ctx);
 }
